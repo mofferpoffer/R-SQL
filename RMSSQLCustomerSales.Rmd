@@ -1,0 +1,605 @@
+---
+title: "SQL with RStudio"
+author: "Marco Langenhuizen"
+date: "6 mei 2018"
+output:
+  html_notebook:
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+    theme: united
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+    toc_float: yes
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In addition to the tidyverse package, we load the DBI package. DBI contains the functionality to connect to external databases.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+```
+
+For this notebook, I connect to my personal SQL Server database. You should connect to your database of choice as well; you won't be able to connect to the database below if you don't have an FHICT account, as the database is behind the FHICT firewall.
+You are not necessarily bound to a SQL Server database. Any database supporting common table expresions (CTEs) and Window Functions, will do. If you wish, you can install SQL Server Express Ecition for free, but PostgreSQL is a good candidate as well. Even MySQL and MariaDB do support CTEs and Window Functions in their latest versions. There might be slight variations in the SQL that the various database servers support, but most of the mentioned servers support a fairly standard level of CTEs and Window Functions.
+
+Use the csv files that come with this notebook, to create the database in the server of your liking.
+
+```{r}
+con <- DBI::dbConnect(
+  odbc::odbc(),
+  Driver    = "SQL Server",
+  Server    = "mssql.fhict.local",
+  Database  = "dbi884568",
+  UID       = "dbi884568",
+  PWD       = "algol68", #rstudioapi::askForPassword("Database password"),
+  Port      = 1433
+)
+```
+
+# Demo Queries
+
+## 1. Total Revenue
+
+_Calculate revenue of all registered sales transactions._
+
+In order to properly value the benefits of having crated a dimensional model of the contents of a transactional model, we first show solutions for this query on both the transactional and the dimensional database.
+
+### On transactional db CustomerSales
+
+Note: for the first three queries, we compare queries on a dimemsnional datamodel with queries on a transactional datmodel where the dimensional model is taken from. If you don't have the original transactional database, never mind, just look at the differences and let yourself be convinced that a dimensional model indeed leads to less complex retrieval queries.
+
+The idea is to first calculate the value of each order line and then sum up those values but we first have to retrieve the price a product had when the order was placed.
+
+```{sql, connection=con}
+select sum(quantity * price) as revenue
+from custorder o
+join orderline l
+    on o.orderno = l.orderno
+join productprice p
+    on p.prodno = l.prodno
+and orderdate between startdate and enddate
+;
+```
+
+### On dimensional db CustomerSalesDW
+
+As the dimensional database is for reporting and analysis purposes only (we won't use it to change data as for instance changing a product's price), we've already calculated the proper order line value upon creating the database. This makes many of our (reporting) queries so much easier!
+
+```{sql, connection=con}
+select sum(linetotal) as revenue
+from factSales
+;
+```
+
+## 2. Revenue per region
+
+_Calculate revenue per sales region of all registered sales transactions._
+
+### On transactional db CustomerSales
+
+In order to get each customer's region code, you have to look it up in the sales region table using part of the customer address as lookup key:
+
+```{sql, connection=con}
+select regioncode, sum(quantity * price) as revenue
+from salesregion r
+join customer c
+    on left(address, 4) between pcbegin and pcend
+join custorder o
+    on c.custno = o.custno
+join orderline l
+    on o.orderno = l.orderno
+join productprice p
+    on p.prodno = l.prodno
+and orderdate between startdate and enddate
+group by regioncode
+;
+```
+
+### On dimensional db CustomerSalesDW
+
+In the dimensional version of CustomerSales, the Customer and SalesRegion tables have been flattened into a single dimDimension table. This leads to much easier retrieval:
+
+```{sql, connection=con}
+select regioncode, sum(linetotal) as revenue
+from factSales s
+join dimCustomer c
+    on s.custno = c.custno
+group by regioncode
+;
+```
+
+## 3. Monthly revenue
+
+_Calculate monthly revenue per product category in 2014._
+
+### On transactional db CustomerSales
+
+```{sql, connection=con}
+select month(orderdate) as monthno, catcode, sum(quantity * price) as revenue
+from custorder o
+join orderline l
+    on o.orderno = l.orderno
+join product p
+    on p.prodno = l.prodno
+join productprice pp
+    on pp.prodno = l.prodno
+and orderdate between startdate and enddate
+where orderdate between '2014-01-01' and '2014-12-31'
+group by month(orderdate), catcode
+order by month(orderdate), catcode
+;
+```
+
+### On dimensional db CustomerSalesDW
+
+```{sql, connection=con, output.var="df_result"}
+select monthno, monthname, catcode, sum(linetotal) as revenue
+from factSales s
+join dimDate
+    on orderdate = dat
+join dimProduct p
+    on p.prodno = s.prodno
+where year = 2014
+group by monthno, monthname, catcode
+;
+```
+
+By capturing the result set in an R dataframe (df_result), we can use R's plotting functionality to visualize the results. Let's use a column chanrt to plot the results:
+
+```{r}
+ggplot(df_result, aes(reorder(monthname, monthno), revenue, fill=catcode)) +
+  geom_col(position=position_dodge()) +
+  labs(
+    x="month",
+    title = "Monthly revenue per product category"
+  )
+```
+
+## 4. Sales transactions per month
+
+_Calculate for each customer the number of sales transactions per month in 2014. Show months without transactions as 0._
+
+I hope I have convincingly made my case that it is easier to query a dimensional database than a transactional database. All remaining queries are defined on the dimensional database.
+
+In one of the earlier queries, months without sales for any of the product categories, wouldn't be visible. For reporting purposes, this is often undesirable. Instead of being invisible, months without sales should be presented as months with 0 revenue. Likewise, months without transactions should be presented as months with 0 transactions.
+
+Using a standard inner join won't do the job: it leaves out months without transactions:
+
+```{sql, connection=con}
+-- wrong result!
+select month(orderdate) as monthno, c.custno, count(distinct orderno) as [#transactions]
+from dimCustomer c
+join factSales s
+    on s.custno = c.custno
+where year(orderdate) = 2014
+group by month(orderdate), c.custno
+order by custno, monthno
+;
+```
+
+Customer 11 has no visible sales for months 4,5, 6. We would like to see these months as well with a sales volume of 0, as this is important information.
+
+Note as well that factSales has order line granularity. In order to get the number of transactions, we have to count the number of unique (distinct) order numbers.
+
+We have to use an outer join to preserve month without sales. As a result, we can't use the orderdate from factSales and that's one of the reasons we've created a date dimension in our model. A first (wrong) attempt could be:
+
+```{sql, connection=con}
+-- wrong result!
+select monthno, c.custno, count(distinct orderno) as [#transactions]
+from dimCustomer c
+left join factSales s
+    on s.custno = c.custno
+left join dimDate
+    on orderdate = dat
+where year = 2014
+group by monthno, c.custno
+order by custno, monthno
+;
+```
+
+Why is this result wrong? Obviously it still lacks the months without sales, but what causes this even if we have used an outer join?
+
+The problem is that we started the query with a left join over dimCustomer. This is gonna show us customers without sales as well, but if we subsequently left join over this result with dimDate, still dates without sales are not shown. To solve this, we should left join over dimDate.
+
+The following query is a working solution. It cross joins dimCustomer with dimDate in order to create all possible customer-month combinations. The result of the cross join is (left) outer joined with factSales and thus effectively preserving all customer-month combination without sales transactions.
+
+```{sql, connection=con, output.var="df_result"}
+select monthno, c.custno, count(distinct orderno) as [#transactions]
+from dimCustomer c
+cross join dimDate
+left join factSales s
+    on s.custno = c.custno
+    and orderdate = dat
+where year = 2014
+group by monthno, c.custno
+order by custno, monthno
+;
+```
+
+```{r}
+df_result %>% 
+  filter(custno == 11) %>% 
+  ggplot(aes(factor(monthno), `#transactions`)) +
+  geom_col()
+```
+
+To understand the `factor()`, leave it out and see the difference o the x-axis labels.
+
+## 5. Monthly product revenue
+
+_Calculate monthly revenue of zwezerik (product: sweetbread) in 2014. Show months without sales as 0._
+
+A working solution in the spirit of previous solution would be:
+
+```{sql, connection=con}
+select monthno, monthname, isnull(sum(linetotal), 0) as revenue
+from dimDate
+cross join dimProduct p
+left join factSales s
+    on p.prodno = s.prodno
+    and orderdate = dat
+where year = 2014
+and proddesc = 'zwezerik'
+group by monthno, monthname
+order by monthno
+;
+```
+
+That's it, working. My advise would be to stick to this pattern for solving this kind of questions.
+
+## 6. Revenue comparison over time
+
+_Compare monthly zwezerik revenue in 2013 and 2014._
+
+We get a straightforward solution by slightly adapting the previous query:
+
+```{sql, connection=con, output.var="df_result"}
+select year, monthno, monthname, coalesce(sum(linetotal), 0) as revenue
+from factSales s
+join dimProduct p
+    on p.prodno = s.prodno
+    and proddesc = 'zwezerik'
+right join dimDate
+    on orderdate = dat
+where year in (2013, 2014)
+group by year, monthno, monthname
+order by year, monthno
+;
+```
+
+```{r}
+head(df_result)
+```
+
+In this output format, It is difficult to compare years by month. There's two ways to come around this: we can change to SQL query in such a way that it returns the result in wide format, or we can use R to post process our result. The easiest way to post process is to use a ggplot bar chart with two series:
+
+```{r}
+df_result %>% 
+  ggplot(aes(factor(monthno), revenue, fill=factor(year))) +
+  geom_col(position="dodge") +
+  labs(x="month", fill="year")
+```
+
+Another possibility would be to use SQL to post process the result. I'm not a fan of it, as I think that SQL should be used to get a valid result in its natural long format only. Then use a presentation platform to bring the result to whatever format you wish. However, because you sometimes need the result of an SQL query to be in wide format, here is the technique you could use.
+
+
+### Wide vs. long format
+
+SQL tables and SQL query results are usually in long format. Suppose we have the following table
+
+```{sql, connection=con}
+select *
+from ( values
+    (20, '2017-10-21', 103, 6),
+    (22, '2017-10-21', 103, 4),
+    (22, '2017-10-21', 101, 2),
+    (20, '2017-11-24', 103, 4),
+    (20, '2017-11-24', 102, 3)
+) as T(custno, orderdate, prodno, qty)
+;
+```
+
+Before creating the chart feeder data, it is necessary to think about what and how you want to present in your visual. Suppose I want to present for each customer, for each month a column bar representing the quantity sold if the specific product. I want customers on the X-axis, months on slicers and products as series.
+
+The same table in wide format with products on columns, would yield:
+
+```{sql, connection=con}
+with cte as (
+    select *
+    from ( values
+        (20, '2017-10-21', 103, 6),
+        (22, '2017-10-21', 103, 4),
+        (22, '2017-10-21', 101, 2),
+        (20, '2017-11-24', 103, 4),
+        (20, '2017-11-24', 102, 3)
+    ) as T(custno, orderdate, prodno, qty)
+)
+select custno, datename(m, orderdate) as mnth,
+    sum(case when prodno = 101 then qty else 0 end) as onions,
+    sum(case when prodno = 102 then qty else 0 end) as beans,
+    sum(case when prodno = 103 then qty else 0 end) as potatoes,
+    sum(case when prodno = 104 then qty else 0 end) as cabbage
+from cte
+group by custno, datename(m, orderdate)
+;
+```
+
+If we apply this to the query above, we get:
+
+```{sql, connection=con}
+select monthno,
+    coalesce(sum(case year when 2013 then linetotal else 0 end), 0) as rev13,
+    coalesce(sum(case year when 2014 then linetotal else 0 end), 0) as rev14
+from factSales s
+join dimProduct p
+    on p.prodno = s.prodno
+    and proddesc = 'zwezerik'
+right join dimDate
+    on orderdate = dat
+where year in (2013, 2014)
+group by monthno
+;
+```
+
+Note that we must no longer group on year if we wish to separate the year in each line of the result set.
+
+## 7. Revenue as percentage of total
+
+_Calculate the monthly revenue in 2014 of each product category as a proportion of total revenue of that month._
+
+```{sql, connection=con}
+select monthname, catcode,
+    coalesce(
+        sum(linetotal)/(
+            select sum(linetotal)
+            from factSales
+            where year(orderdate) = 2014
+            and month(orderdate) = monthno
+        ),
+        0
+    ) as [propRev]
+from dimDate
+cross join dimProduct p
+left join factSales s
+    on p.prodno = s.prodno
+    and orderdate = dat
+where year = 2014
+group by monthno, monthname, catcode
+order by monthno
+;
+```
+Here we used a so-called correlated subquery: the subquery references a column value in the outer query. As a consequence, the subquery should be re-calculated for each row in the outer query, and hence are usually expensive performance wise.
+
+Note that in the inner query we do not join with dimDate. This is not necessary. If there are no sales in a specific month, the subquery (and the outer query) would resolve to NULL and that is exactly what you want: you can't calculate the percentage of _nothing of nothing_.
+
+Alternatively, we can make use of a so called window function:
+
+```{sql, connection=con}
+select monthname, catcode,
+    coalesce(sum(linetotal)/(sum(sum(linetotal)) over (partition by monthno)), 0) as [propRev]
+from dimDate
+cross join dimProduct p
+left join factSales s
+    on p.prodno = s.prodno
+    and orderdate = dat
+where year = 2014
+group by monthno, monthname, catcode
+order by monthno
+;
+```
+
+Note that in the `sum(sum())` construction, the outer `sum()` is the windows function that goes with the partition by whereas the inner `sum()` is the aggregate function that goes with the group by. There are many learning resources about SQL window functions avaialble on the web. [Here](https://goo.gl/jrPDS9) is one of them.
+
+If this construction is uneasy to your eyes, you could rewrite it using a common table expressions, so without a correlation and without a window function:
+
+```{sql, connection=con}
+with cte as (
+	select month(orderdate) as mno, sum(linetotal) as rev
+	from factSales s
+	where year(orderdate) = 2014
+	group by month(orderdate)
+)
+select monthno, mno, catcode, sum(linetotal) as rev2, rev, sum(linetotal)/rev as [%rev]
+from dimDate
+cross join dimProduct p
+left join factSales s
+    on p.prodno = s.prodno
+    and orderdate = dat
+left join cte
+	on monthno = mno
+where year = 2014
+group by monthno, monthname, mno, catcode, rev
+order by monthno
+;
+```
+
+In an Excel pivot table this query would be calculated using the % of row total measure with product category on rows. Yet another alternative SQL solution that mimics this pivot table solution would be:
+
+```{sql, connection=con}
+select monthname,
+    isnull(sum(case when catcode = 'bio' then linetotal else 0 end)/sum(linetotal), 0) as bio,
+    isnull(sum(case when catcode = 'lux' then linetotal else 0 end)/sum(linetotal), 0) as lux,
+    isnull(sum(case when catcode = 'zuv' then linetotal else 0 end)/sum(linetotal), 0) as zuv
+from dimDate
+cross join dimProduct p
+left join factSales s
+    on p.prodno = s.prodno
+    and orderdate = dat
+where year = 2014
+group by monthno, monthname
+order by monthno
+;
+```
+
+Note that instead of using a `coalesce()`, I used an `isnull()` function in this query. `isnull()` is a non SQL standard function from SQL Server that operates identical to `coalesce()` in this case.
+
+## 8. Cumulative revenue
+
+_Calculate cumulative monthly revenue per product in 2014. Show results in a chart._
+
+First use a cross join to generate all month/product combinations. Then use a left (outer) join to preserve month/product combinations without sales:
+
+```{sql, connection=con}
+select monthno, monthname, proddesc, isnull(sum(linetotal), 0) as revenue
+from dimDate
+cross join dimProduct p
+left join factSales s
+    on s.prodno = p.prodno
+    and orderdate = dat
+where year = 2014
+group by monthno, monthname, proddesc
+;
+```
+
+In order to cumulate the monthly results, we could use a self-join:
+
+```{sql, connection=con, output.var="df_result"}
+with cte as (
+	select monthno, proddesc, coalesce(sum(linetotal), 0) as revenue
+	from dimDate
+	cross join dimProduct p
+	left join factSales s
+		on s.prodno = p.prodno
+		and orderdate = dat
+	where year = 2014
+	group by monthno, proddesc
+)
+select c2.monthno, c2.proddesc, sum(c1.revenue) as crev
+from cte c1
+join cte c2
+	on c1.proddesc = c2.proddesc
+	and c1.monthno <= c2.monthno
+group by c2.monthno, c2.proddesc
+```
+
+To calculate the cumulative revenue, we could also stick close to the non-cumulative solution and use a window function:
+
+```{sql, connection=con, output.var="df_result"}
+select monthno, monthname, proddesc,
+    coalesce(sum(sum(linetotal)) over (partition by proddesc order by monthno), 0) as cumrev
+from dimDate
+cross join dimProduct p
+left join factSales s
+    on s.prodno = p.prodno
+    and orderdate = dat
+where year = 2014
+group by monthno, monthname, proddesc
+;
+```
+
+```{r}
+df_result %>% 
+  ggplot(aes(factor(monthno), cumrev)) +
+  geom_line(aes(colour=proddesc, group=proddesc)) +
+  labs(x="month", y="cumulative revenue", colour="product category")
+```
+
+Note the sum(sum()): the outer sum() is the window function, whereas the inner sum() is the aggregate function we used in our first step. The `partition by` creates a window of all lines having the same proddesc in a month/proddesc group.
+
+## 9. YoY cumulative sales increase
+
+_Calculate monthly year-over-year cumulative sales increase (proportion of last year's sales) for each product category in 2013._
+
+This is a combination of two previous demo queries:
+
+```{sql, connection=con, output.var="df_result"}
+with cte as (
+    select monthno, monthname, catcode,
+        coalesce(sum(sum(case year when 2013 then linetotal end)) over (partition by catcode order by monthno), 0) as cumrev13,
+        coalesce(sum(sum(case year when 2012 then linetotal end)) over (partition by catcode order by monthno), 0) as cumrev12
+    from dimDate
+    cross join dimProduct p
+    left join factSales s
+        on s.prodno = p.prodno
+        and orderdate = dat
+    where year in (2013, 2012)
+    group by monthno, monthname, catcode
+)
+select monthno, monthname, catcode,
+    (cumrev13 - cumrev12)/cumrev12 as [YoY Rev Increase %]
+from cte
+;
+```
+
+```{r}
+df_result %>% 
+  ggplot(aes(factor(monthno), `YoY Rev Increase %`, fill = catcode)) +
+  geom_col(position="dodge")
+```
+
+## 10. Average of last two
+
+_Calculate for each customer the average order value of last two orders._
+
+First generate a list of order values ordered by order date (most recent on top)
+
+```{sql, connection=con}
+select custno, orderno, orderdate, sum(linetotal) as ordVal
+from factSales
+group by custno, orderno, orderdate
+;
+```
+
+Then add ranking, select top 2 per customer and calculate average:
+
+```{sql, connection=con}
+with cte as (
+    select custno, orderno, orderdate, sum(linetotal) as ordVal,
+        row_number() over (partition by custno order by orderdate desc) as rnr
+    from factSales
+    group by custno, orderno, orderdate
+)
+select custno, avg(ordval)
+from cte
+where rnr <= 2
+group by custno
+;
+```
+
+Here we use `row_number()` to rank orders. `row_number()` is non-deterministic, meaning that is there is a tie, it is undetermined what the order will be. In this case this could be a problem if a customer had more than 2 orders on his last order date. It is undetermined then which 2 orders will be picked to calculate the average from. The only way to avoid this is to add a tie breaker: in this case we add ordervalue to the order in the window clause: `order by orderdate desc, sum(linetotal)`.
+
+
+## 11. Weekday revenue proportion
+
+_Calculate for each customer the proportion of orders placed on a weekday (non weekend day) in 2012._
+
+```{sql, connection=con}
+select custno,
+    avg(case when datepart(dw, orderdate) between 2 and 6 then 1.0 else 0.0 end) as wkdy
+from factSales
+where year(orderdate) = 2012
+group by custno
+;
+```
+
+Mapping to 1 (TRUE) and 0 (FALSE) and then calculate the average is a common pattern to calculate the proportion of TRUEs.
+
+## 12. Ranking revenue
+
+_Give a weekday (day name) ranking for the first quarter of 2014 with the best selling (revenue) weekday on top. Visualize in a horizontal column chart._
+
+```{sql, connection=con, output.var="df_result"}
+select dayname, coalesce(sum(linetotal), 0) as rev
+from dimDate
+left join factSales
+  on dat = orderdate
+where year = 2014 and quarter = 'Q1'
+group by dayname
+order by rev desc
+;
+```
+
+```{r}
+df_result %>% 
+  ggplot(aes(reorder(dayname, rev), rev)) +
+  geom_col() +
+  labs(x="day of week") +
+  coord_flip()
+```

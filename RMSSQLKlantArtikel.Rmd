@@ -1,0 +1,119 @@
+---
+title: "RwithSQL"
+author: "Marco Langenhuizen"
+date: "2018 M08 29"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+con <- DBI::dbConnect(
+  odbc::odbc(),
+  Driver    = "SQL Server",
+  Server    = "mssql.fhict.local",
+  Database  = "dbi884568_klantartik",
+  UID       = "dbi884568_klantartik",
+  PWD       = "kl@nt4artikel", #rstudioapi::askForPassword("Database password"),
+  Port      = 1433
+)
+```
+
+```{sql, connection=con}
+select woonplaats, year(besteldatum) as jaar, month(besteldatum) as maand,
+  count(*) as aantal
+from klant k
+join bestelling b
+  on k.klantnr = b.klantnr
+group by woonplaats, year(besteldatum), month(besteldatum)
+order by woonplaats, jaar, maand
+;
+```
+
+We can also attach the resultset of an SQL query to an R variable. The resultset is returned as a dataframe.
+
+```{sql, connection=con, output.var=df_sales}
+select b.bestelnr, klantnr, verkoper, besteldatum, leverdatum, betaaldatum, aantal, r.artikelnr, a.catcode, prijs * aantal as prijs
+from bestelling b
+join bestelregel r
+  on b.bestelnr = r.bestelnr
+join artikel a
+  on r.artikelnr = a.artikelnr
+join artikelcategorie c
+  on a.catcode = c.catcode
+join artikelprijs p
+  on r.artikelnr = p.artikelnr
+  and besteldatum between begindatum and einddatum
+;
+```
+
+Now print the query result.
+
+```{r}
+df_sales
+```
+
+In the result we can see that all dates have a character string datatype. We want them to be proper dates so that we can use all date related functions such as `month()` and `year()`. We change the types using a `dplyr::mutate()`.
+
+```{r}
+library(lubridate)
+
+df_sales <- df_sales %>% 
+  mutate(
+    besteldatum=as_date(besteldatum),
+    leverdatum=as_date(leverdatum),
+    betaaldatum=as_date(betaaldatum)
+  )
+```
+
+Now we should be able to use lubridate's diverse set of date functions.
+
+```{r}
+df_sales %>% 
+  group_by(jaar=year(besteldatum),  maand=month(besteldatum, label=TRUE)) %>% 
+  summarise(totaal=sum(prijs))
+```
+
+Now that our dates are proper R dates, we can use lubridate's date/time functios.
+
+```{r}
+df_sales %>% 
+  filter(year(besteldatum) == 2014) %>% 
+  group_by(maand=month(besteldatum, label=TRUE)) %>% 
+  summarise(totaal=sum(prijs))
+```
+
+Note that the result type of `month(besteldatum, label=TRUE)` is ordered factor (ord). If we would make a plot with month on axis, the order will be ok.
+
+```{r}
+library(dbplot)
+
+df_sales %>% 
+  filter(year(besteldatum) == 2014) %>% 
+  group_by(maand=month(besteldatum, label=TRUE)) %>% 
+  summarise(totaal=sum(prijs)) %>% 
+  dbplot_bar(maand, totaal)
+```
+
+The dbplot package is a layer over the ggplot plotting package. Dbplot offers us a small subset of ggplot's plotting functionality by pushing the calculation of the plot dataset to the database back-end. In the query above we were explicit about most of the back-end calculation, but dbplot can figure out a lot by itself. Alternatively to the query above, we could have specified:
+
+```{r}
+df_sales %>% 
+  filter(year(besteldatum) == 2014) %>% 
+  dbplot_bar(month(besteldatum, label=TRUE), sum(prijs))
+```
+
+Closing RStudio automatically disconnects.
+
+```{r}
+#DBI::dbDisconnect(con)
+```
+

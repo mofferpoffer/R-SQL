@@ -1,0 +1,218 @@
+---
+title: "Querying the CustomerSalesDW sqlite database using SQL in RStudio"
+author: "Marco Langenhuizen"
+date: "6 mei 2018"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    theme: united
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+
+opts_chunk$set(echo = TRUE)
+opts_chunk$set(table.format = "html")
+opts_chunk$set(table.pad = 0)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+```
+
+Load the pre-constructed CustomerSalesDW database. This is a sqlite database consisiting of a small sales datawarehouse. It has dimension tables for customer, salesrep, product and date, and a fact table for historic sales. The grain in the sales fact table is the individual order line. Orders may consist of more than one order line.
+
+
+
+```{r}
+
+con <- DBI::dbConnect(RSQLite::SQLite(), "CustomerSalesDW.db")
+
+DBI::dbListTables(con)
+```
+
+## Revenue per region
+
+_Calculate revenue per sales region of all registered sales transactions._
+
+In the dimensional version of CustomerSales, the Customer and SalesRegion tables have been flattened into a single dimDimension table. This leads to much easier retrieval:
+
+```{sql, connection=con, output.var="df_result"}
+select regioncode, sum(linetotal) as revenue
+from factSales s
+join dimCustomer c
+    on s.custno = c.custno
+group by regioncode
+;
+```
+
+Use the knitr table output function to get a better formatted table.
+
+```{r echo=FALSE}
+kable(head(df_result))
+```
+
+## Monthly revenue
+
+_Calculate monthly revenue per product category in 2014._
+
+```{sql, connection=con, output.var="df_result"}
+select monthNo, monthName, catcode, sum(linetotal) as revenue
+from factSales s
+join dimDate
+    on orderdate = dat
+join dimProduct p
+    on p.prodno = s.prodno
+where year = 2014
+group by monthno, monthname, catcode
+;
+```
+
+Plot the results in a column chart:
+
+```{r}
+ggplot(df_result, aes(reorder(monthName, monthNo), revenue, fill=catcode)) +
+  geom_col(position=position_dodge()) +
+  labs(
+    x="month",
+    title = "Monthly revenue per product category"
+  )
+```
+
+Note that without a date table we would have to use sqlite specific date handling... very annoying.
+
+```{sql, connection=con, output.var="df_result"}
+select cast(strftime('%m', orderdate) as integer) as monthNo, catcode, sum(linetotal) as revenue
+from factSales s
+join dimProduct p
+    on p.prodno = s.prodno
+where strftime('%Y', orderdate) = '2014'
+group by strftime('%m', orderdate), catcode
+;
+```
+
+```{r}
+df_result %>% 
+  mutate(monthName = month.abb[monthNo]) %>% 
+  ggplot(aes(reorder(monthName, monthNo), revenue, fill=catcode)) +
+    geom_col(position=position_dodge()) +
+    labs(
+      x="month",
+      title = "Monthly revenue per product category"
+    )
+```
+
+## Sales transactions per month
+
+_Calculate for each customer the number of sales transactions per month in 2014. Show months without transactions as 0._
+
+In the query above, months without sales for any of the product categories, wouldn't be visible. For reporting purposes, this is often undesirable. Instead of being invisible, months without sales should be presented as months with 0 revenue. Likewise, months without transactions should be presented as months with 0 transactions.
+
+Using a standard inner join won't do the job: it leaves out months without transactions:
+
+```{sql, connection=con, output.var="df_result"}
+-- wrong result!
+select monthNo, c.custno, name, count(distinct orderno) as [#transactions]
+from factSales s
+join dimCustomer c
+    on s.custno = c.custno
+join dimDate
+    on orderdate = dat
+where year = 2014
+group by monthNo, c.custno, name
+order by name, monthNo
+;
+```
+
+```{r}
+kable(head(df_result))
+```
+
+Then let's focus on the customer/month combinations without sales:
+
+```{sql, connection=con, output.var="df_result"}
+select monthNo, c.custno, name 
+from dimCustomer c cross join dimDate
+left join factSales s
+  on s.custno = c.custno
+  and orderdate = dat
+where year = 2014
+group by monthNo, c.custno, name
+having count(orderno) = 0
+order by name, monthNo
+```
+
+```{r}
+kable(head(df_result))
+```
+
+Combining last two queries would give us to the required result. We could use a `union` for that, but a better solution is to combine both ideas in a single query:
+
+
+```{sql, connection=con, output.var="df_result"}
+select monthNo, c.custno, name, count(distinct orderno) as [#transactions]
+from dimCustomer c cross join dimDate
+left join factSales s
+    on s.custno = c.custno
+    and orderdate = dat
+where year = 2014
+group by monthno, c.custno, name
+order by name, monthno
+;
+```
+
+```{r}
+kable(head(df_result))
+```
+
+Note that factSales has order line granularity. In order to get the number of transactions, we have to count the number of unique (distinct) order numbers.
+
+## Average order value
+
+_Calculate for each customer the average order value in 2014._
+
+Be careful; we have to do this in two steps as we do not want to calculate the average order line value!
+
+```{sql, connection=con, output.var="df_result"}
+select name, c.custno, avg(ordervalue) as avgValue
+from (
+    select custno, orderno, sum(linetotal) as ordervalue
+    from factSales
+    where strftime('%Y', orderdate) = '2014'
+    group by custno, orderno
+) s
+join dimCustomer c
+  on s.custno = c.custno
+group by name, c.custno
+```
+
+```{r}
+ggplot(df_result, aes(custno, avgValue)) +
+  geom_col() +
+  labs(title="Average ordervalue in 2014")
+```
+
+
+The evaluation order of an SQL query is inside out. This makes it difficult to understand as we are used to understanding text from top to bottom. Luckily, SQL has common table expressions to facilitate top to bottom reading. A CTE (common table expression) is introduced with a `with` clause:
+
+```{sql, connection=con, output.var="df_result"}
+with cte as (
+    select custno, orderno, sum(linetotal) as ordervalue
+    from factSales
+    where strftime('%Y', orderdate) = '2014'
+    group by custno, orderno
+)
+select name, c.custno, avg(ordervalue) as avgValue
+from cte
+join dimCustomer c
+  on cte.custno = c.custno
+group by name, c.custno
+```
+
+```{r}
+kable(head(df_result))
+```
+
+Especially with long queries, CTE's can really come to the rescue

@@ -1,0 +1,176 @@
+---
+title: "Querying the CustomerSales Datawarehouse database"
+author: "Marco Langenhuizen"
+date: "2018 M09 8"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+con <- DBI::dbConnect(
+  odbc::odbc(),
+  Driver    = "SQL Server",
+  Server    = "mssql.fhict.local",
+  Database  = "dbi884568_db",
+  UID       = "dbi884568_db",
+  PWD       = "algol68", #rstudioapi::askForPassword("Database password"),
+  Port      = 1433
+)
+```
+
+## 1. Revenue per region
+
+Calculate revenue per sales region of all registered sales transactions.
+
+### On transactional db CustomerSales
+
+In order to get each customer's region code, you have to look it up in the sales region table using part of the customer address as lookup key:
+
+```{sql, connection=con}
+select regioncode, sum(quantity * price) as revenue
+from salesregion r
+join customer c
+    on left(address, 4) between pcbegin and pcend
+join custorder o
+    on c.custno = o.custno
+join orderline l
+    on o.orderno = l.orderno
+join productprice p
+    on p.prodno = l.prodno
+and orderdate between startdate and enddate
+group by regioncode
+;
+```
+
+### On dimensional db CustomerSalesDW
+
+In the dimensional version of CustomerSales, the Customer and SalesRegion tables have been flattened into a single dimDimension table. This leads to much easier retrieval:
+
+```{sql, connection=con}
+select regioncode, sum(linetotal) as revenue
+from factSales s
+join dimCustomers c
+    on s.custno = c.custno
+group by regioncode
+;
+```
+
+We want to further analyse the data. As the database is very small, we load the data in our computer memory. For databases that aren't really big (millions of rows), this will probably accellerate our queries, although this database is way too small to even notice that.
+
+As we load the db content into computer memory, we take advantage of restructuring the database: we restructure from the relational model of the external database to a dimensional model of the in-memory datatables. Dimensional models are easier to analyse.
+
+Now let's create an in-memory dimensional model from our external database.
+
+```{r}
+dimCustomers <- tbl(con, "dimCustomers") %>% 
+  collect()
+
+dimProducts <- tbl(con, "dimProducts") %>% 
+  collect()
+
+dimSalesPersons <- tbl(con, "dimSalesPersons") %>% 
+  collect()
+
+dimRegManagers <- tbl(con, "dimRegManagers") %>% 
+  collect()
+
+factSales <- tbl(con, "factSales") %>% 
+  collect()
+```
+The `tbl()` functions creates a pointer (virtual table) to the table in the external database. The `collect()` function materializes the virtual table into a real R table, stored in-memory.
+
+An alternative approach would have been to create a single join-them-all table just we wouldcreate a source table for an Excel pivot table. This would have spaired u a lot of joining. The reason that we stick to the dimensional model is that it offers us the opportunity to create outer joins. That is convenient if we, for instance, want to know each customer's revenue in a certain period of time. Often, we also want to know which customers did not generate any revenue at all in that period.
+
+In addition we have to create a date dimension. That's straighforward using R with lubridate.
+ 
+```{r}
+dimDates <- tibble(
+  date = seq.Date(ymd(20140101), ymd(20161231), by="1 day"),
+  yr = as.character(year(date)),
+  qtr = paste0('q', quarter(date)),
+  month = month(date, label=TRUE),
+  wk = as.character(week(date)),
+  day = wday(date, label=TRUE)
+)
+```
+ 
+### On in-memory dataframes
+
+Now that we have the tables (dataframes) of our dimensional model stored in-memory, we can query the model using both R/dplyr and SQL. If we opt for SQL querying, we have to load the SQLdf package and we are bound to use slite's variant of SQL.
+
+```{r}
+library(sqldf)
+```
+
+```{r}
+sqldf("
+  select regioncode, sum(linetotal) as revenue
+  from dimCustomers c
+  left join factSales s
+      on s.custno = c.custno
+  group by regioncode
+")
+```
+
+Although the same SQL as we used before to query our SQLServer database, this SQL is in sqlite SQL and queries the in-memory  R dataframes. Such a versatile programming environment!
+
+Now, let's create a dplyr query for this SQL query.
+
+```{r}
+dimCustomers %>% 
+  left_join(factSales) %>% 
+  group_by(regioncode) %>% 
+  summarise(revenue = sum(lineTotal))
+```
+
+## 3. Monthly revenue
+
+Calculate monthly revenue per product category in 2016.
+
+### On transactional db CustomerSales
+
+```{sql, connection=con}
+select month(orderdate) as monthno, catcode, sum(quantity * price) as revenue
+from custorder o
+join orderline l
+    on o.orderno = l.orderno
+join product p
+    on p.prodno = l.prodno
+join productprice pp
+    on pp.prodno = l.prodno
+and orderdate between startdate and enddate
+where orderdate between '2016-01-01' and '2016-12-31'
+group by month(orderdate), catcode
+order by month(orderdate), catcode
+;
+```
+
+### On dimensional db CustomerSalesDW
+
+```{sql, connection=con}
+select monthno, monthname, catcode, sum(linetotal) as revenue
+from factSales s
+join dimDate
+    on orderdate = dat
+join dimProduct p
+    on p.prodno = s.prodno
+where year = 2016
+group by monthno, monthname, catcode
+;
+```
+
+### On in-memory dataframes
+
+```{r}
+
+```
+

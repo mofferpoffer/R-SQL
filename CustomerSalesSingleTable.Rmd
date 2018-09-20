@@ -1,0 +1,286 @@
+---
+title: "Querying the CustomerSales Single Table database"
+author: "Marco Langenhuizen"
+date: "2018 M09 8"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+```
+
+```{r}
+con <- DBI::dbConnect(
+  odbc::odbc(),
+  Driver    = "SQL Server",
+  Server    = "mssql.fhict.local",
+  Database  = "dbi884568_db",
+  UID       = "dbi884568_db",
+  PWD       = "algol68", #rstudioapi::askForPassword("Database password"),
+  Port      = 1433
+)
+```
+
+```{sql connection=con, output.var="df_sales"}
+select 
+    o.orderno, 
+    orderdate, 
+    deliverydate, 
+    paydate, 
+    p.prodno,
+    proddesc,
+    p.catcode,
+    quantity,
+    price,
+    (quantity * price) as linetotal,
+    c.custno,
+    c.name,
+    address,
+    city,
+    regioncode,
+    regionmgr,
+    e1.name as mgrnm,
+    salesrep,
+    e2.name as repnm
+from custorder o
+join employee e1
+    on salesrep = e1.empno
+join customer c
+    on o.custno = c.custno
+join salesregion
+    on left(address, 4) between pcbegin and pcend
+join employee e2
+    on regionmgr = e2.empno
+join orderline l
+    on o.orderno = l.orderno
+join product p
+    on l.prodno = p.prodno
+join productcategory pc
+    on p.catcode = pc.catcode
+join productprice pp
+    on p.prodno = pp.prodno
+    and orderdate between startdate and enddate
+;
+```
+
+```{r}
+head(df_sales, 3)
+```
+
+Note that the chank directive `output.var=df_sales` resulted in a regular df_sales dataframe that stores the full result set of the SQL query. We can lookup the type of a variable using the `class()` function: 
+
+```{r}
+class(df_sales)
+```
+
+Compare the SQL query above with this one:
+
+```{r}
+df_sales <- tbl(con, sql("
+  select 
+      o.orderno, 
+      orderdate, 
+      deliverydate, 
+      paydate, 
+      p.prodno,
+      proddesc,
+      p.catcode,
+      quantity,
+      price,
+      (quantity * price) as linetotal,
+      c.custno,
+      c.name,
+      address,
+      city,
+      regioncode,
+      regionmgr,
+      e1.name as mgrnm,
+      salesrep,
+      e2.name as repnm
+  from custorder o
+  join employee e1
+      on salesrep = e1.empno
+  join customer c
+      on o.custno = c.custno
+  join salesregion
+      on left(address, 4) between pcbegin and pcend
+  join employee e2
+      on regionmgr = e2.empno
+  join orderline l
+      on o.orderno = l.orderno
+  join product p
+      on l.prodno = p.prodno
+  join productcategory pc
+      on p.catcode = pc.catcode
+  join productprice pp
+      on p.prodno = pp.prodno
+      and orderdate between startdate and enddate
+"))
+```
+
+Same SQL query, same result set from the database back-end, but different storage in our RStudio front-end. Let's again look at the type of df_sales:
+
+```{r}
+class(df_sales)
+```
+
+That's a different type for df_sales. Now, as a result of the `dplyr::tbl()` function,  df_sales is a pointer (virtual table) to a result set in the back-end database instead of an in-memory dataframe cotaining all the data obtained from the database. Now almost no internal memory is spent on the dataframe. For huge datasets, this obviously has its advantages. However, for some operations, such as plotting the dataset, it is required that the data resides in internal memory. Moreover, since we have a very small dataset, the storage cost advantages are probably outweighed by the lag it takes to connect to the external datasource. To overcome this, we can materialize the virtual table to a regular in-memory dataframe using `collect()`. We then end up with the same dataframe that we had from the first SQL query.
+
+```{r}
+df_sales <- collect(df_sales)
+class(df_sales)
+```
+
+Using `collect(), we have coerced the virtual df_sales table into a proper, in-memory dataframe. We now disconnect from the database as we have the required data in-memory and continue working with that.
+
+```{r}
+DBI::dbDisconnect(con)
+```
+
+You may have noticed in looking at the contents of the dataframe that our date variables are of type `char` instead of `date`. We can fix this with `dplyr::mutate_at()`:
+
+```{r}
+df_sales <- df_sales %>% 
+  mutate_at(vars(ends_with("date")), as_date)
+head(df_sales, 3)
+```
+
+We can now start querying the dataframe.
+
+## Ordered plotting
+
+### Show each customer's revenue in 2016. Show cutomers in descending order of revenue.
+
+If we want to sort the result set of a dplyr table we usually apply `dplyr::arrange()` as the last step.
+
+```{r}
+df_ <- df_sales %>% 
+  # concatenate customer name and number as there may be duplicates in names
+  # instead of stringr::str_c(), base::paste() or base::paste0() is often used
+  group_by(customer = str_c(name, " (", custno, ")")) %>% 
+  summarise(revenue = sum(linetotal)) %>% 
+  arrange(desc(revenue))
+df_
+```
+
+However, if we plot this ordered dataframe with ggplot, the order seems to have disappeared.
+
+```{r}
+df_ %>% 
+  ggplot(aes(customer, revenue)) +
+  geom_col() +
+  coord_flip()
+```
+
+The reason dplyr ordering has disappeared is that ggplot has its own ordering logic: numbers are always ordered small to large, strings are ordered A-z, factors are ordered conform their levels. So if we want a specific non-alphabetic order for a string vector, we have to coerce that vector into an ordered factor. We can either use `base::reorder` of `forcats::fct_reorder()` for that.
+
+```{r}
+df_ %>% 
+  ggplot(aes(fct_reorder(customer, revenue), revenue)) +
+  geom_col() +
+  labs(x = "customer") +
+  coord_flip()
+```
+
+`reorder()` and `fct_reorder()` both reorder a factor variable and a string vector. A string vector is changed to a factor before imposing a specific order on it.
+
+## Incomplete data
+
+### Show the 2016 monthly revenue of customer 12.
+
+In SQL we would do the following.
+
+```{r}
+sqldf::sqldf("
+  select strftime('%m', orderdate) as mnth, sum(linetotal) as rev
+  from df_sales
+  where (strftime('%Y', orderdate) = '2016') and (custno = '12')
+  group by mnth
+")
+```
+
+
+```{r}
+df_sales %>% 
+  filter(year(orderdate) == 2016, custno == 12) %>% 
+  group_by(month=month(orderdate, label = TRUE)) %>% 
+  summarize(rev = sum(linetotal))
+```
+
+It is clear that customer 12 hasn't ordered in all months of the year. The result is implicit about this: some months are lacking in the result. Often you want to be explicit about this, as this is important information as well. Especially when you are plotting your results:
+
+```{r}
+df_sales %>% 
+  filter(year(orderdate) == 2016, custno == 12) %>% 
+  group_by(month=month(orderdate, label = TRUE)) %>% 
+  summarize(rev = sum(linetotal)) %>%
+  ggplot(aes(month, rev)) +
+  geom_col()
+```
+
+It is strange and annoying that months without orders are not shown in the plot. We would like the missing months be visualized with a zero revenue. In order to dos so we have to complete our result set. For that we use `tidyr::complete()`:
+
+```{r}
+df_sales %>% 
+  filter(year(orderdate) == 2016, custno == 12) %>% 
+  group_by(month=month(orderdate, label = TRUE)) %>% 
+  summarize(rev = sum(linetotal)) %>% 
+  complete(month = month(ymd(20160101) + months(0:11), label = TRUE), fill = list(rev = 0)) %>% 
+  ggplot(aes(month, rev)) +
+  geom_col()
+```
+
+Because `lubridate::month()` returns an ordered factor with all months of the year as predefined headers, we can also solve this problem entirely in ggplot. We need to indicate that ggplot should not drop unknown levels in the month variable.
+
+```{r}
+df_sales %>% 
+  filter(year(orderdate) == 2016, custno == 12) %>% 
+  group_by(month=month(orderdate, label = TRUE)) %>% 
+  summarize(rev = sum(linetotal)) %>%
+  ggplot(aes(month, rev)) +
+  geom_col() +
+  scale_x_discrete(drop=FALSE)
+```
+
+Although this works just fine here, I prefer the solution with `tidyr::complete()` as this technique also works with categorical variables as strings and not just with ordered factors.
+
+### Show for each city, the average number of orders per week day in 2016.
+
+Another way to implicitly make missing data explicit is by using grid based plots:
+
+```{r}
+df_sales %>% 
+  filter(between(orderdate, ymd(20160101), ymd(20161231))) %>% 
+  group_by(city, wkday = wday(orderdate, label=TRUE)) %>% 
+  summarize(nr_orders = n_distinct(orderno)/52) %>% 
+  ggplot(aes(wkday, nr_orders)) +
+    geom_col() +
+    facet_grid(~city)
+```
+
+### Show for each customer the number of days between last 2 orders.
+
+In order to the last two orders for each customer, we first need to reduce from order lines to orders. We then number each order from most recent to oldest, using the `row_number()` function in a group-by context. The `row_number()` function then acts as a window function: lines are numbered 1-n within each group. If we then filter only the two lowest numbered, we get the two most recent orders. From then we can reduce to custno by summarising to the minimum date and maximaum date of the 2 most recent dates.
+
+We need to take care of the special case that a customer had only 1 order and consrequently doesn't have two most recent.
+
+```{r}
+df_sales %>% 
+  distinct(custno, orderno, orderdate) %>% 
+  group_by(custno) %>% 
+  arrange(desc(orderdate), .by_group = TRUE) %>% 
+  filter(between(row_number(), 1, 2)) %>% 
+  summarize(ddiff = case_when(
+    n() == 2 ~ as.duration(interval(min(orderdate), max(orderdate)))/ddays(1),
+    n() == 1 ~ as.double(NA)
+  ))
+```
+
+Getting the number of days between 2 dates is a bit verbose: first we create an interval an by casting the interval to a duration and dividing by a 1 day duaration to get the number of days.
